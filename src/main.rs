@@ -1,15 +1,18 @@
+use std::io::Cursor;
+use std::{collections::HashMap, sync::Arc};
+
 use axum::{
     Router,
+    extract::{DefaultBodyLimit, Multipart, State},
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Json, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 
 use axum_extra::response::file_stream::FileStream;
 use clap::Parser;
-use serde_json::{Value, json};
-use tokio::fs::File;
-use tokio::net::TcpListener;
+use serde::{Deserialize, Serialize};
+use tokio::{fs::File, net::TcpListener, sync::Mutex};
 use tokio_util::io::ReaderStream;
 
 #[derive(Debug, Parser)]
@@ -17,27 +20,13 @@ struct Command {
     #[arg(short, long)]
     video_path: Option<String>,
 }
-use tower_http::cors::{Any, CorsLayer};
 
-// frame frontend
-// 1. video player that fetches content from the server
-// 2.
-
-// vidcast:
-// 1. user uploads a video
-// 2. video is converted into suitable format
-// 3. algorithm compresses
-// 4. a new account is purchased
-// 5. that account is used to store the bytes of data to the hub
-//  5a. unique id per user --> linked to a buch of casts
-
-async fn file_stream() -> Result<Response, (StatusCode, String)> {
-    let file = File::open("src/videos/stutter.mp4")
-        .await
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("File not found: {e}")))?;
+async fn file_stream(State(state): State<Database>, name: String) -> Result<Response, StatusCode> {
+    let file = state.get(name).await?;
 
     // Create the basic file stream
-    let mut file_stream_resp = FileStream::new(ReaderStream::new(file)).file_name("lmao.mp4");
+    let file_stream_resp =
+        FileStream::new(ReaderStream::new(Cursor::new(file))).file_name("lmao.mp4");
 
     // Convert to a response so we can modify headers
     let mut response = file_stream_resp.into_response();
@@ -51,12 +40,9 @@ async fn file_stream() -> Result<Response, (StatusCode, String)> {
     Ok(response)
 }
 
-async fn video_html() -> Html<String> {
+async fn frontend() -> Html<String> {
     let content = r#"<head>
             <link href="https://vjs.zencdn.net/8.16.1/video-js.css" rel="stylesheet" />
-
-            <!-- If you'd like to support IE8 (for Video.js versions prior to v7) -->
-            <!-- <script src="https://vjs.zencdn.net/ie8/1.1.2/videojs-ie8.min.js"></script> -->
         </head>
 
         <body>
@@ -84,32 +70,105 @@ async fn video_html() -> Html<String> {
                 </p>
             </video>
 
+            <div class="upload-form">
+                <h2>Upload Video</h2>
+                <form action="/upload" method="post" enctype="multipart/form-data">
+                    <label for="file">Select a video file:</label>
+                    <input type="file" id="file" name="file" accept="video/*"><br>
+                    <input type="submit" value="Upload">
+                </form>
+            </div>
+
+            <div class="section">
+                <h2>Get Video by Name</h2>
+                <form action="/video" method="get">
+                    <div class="form-row">
+                        <label for="video-name">Video name:</label>
+                        <input type="text" id="video-name" name="name" required>
+                    </div>
+                    <input type="submit" value="Get Video" class="btn-blue">
+                </form>
+            </div>
+
+
             <script src="https://vjs.zencdn.net/8.16.1/video.min.js"></script>
         </body>"#;
 
     Html(content.to_string())
 }
 
+async fn upload(
+    State(mut state): State<Database>,
+    mut multipart: Multipart,
+) -> Result<Response<String>, StatusCode> {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        let name = field.name().unwrap().to_string();
+        let data = field
+            .bytes()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        println!("Length of `{}` is {} bytes", &name, &data.len());
+
+        state.add(name, data.into()).await?;
+    }
+
+    let response = Response::builder()
+        .status(StatusCode::CREATED)
+        .body("OK".to_string());
+
+    response.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Debug, Clone)]
+struct Database {
+    data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+impl Database {
+    pub fn new() -> Self {
+        Self {
+            data: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub async fn add(&mut self, name: String, content: Vec<u8>) -> Result<Vec<u8>, StatusCode> {
+        self.data
+            .lock()
+            .await
+            .insert(name, content)
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+
+    pub async fn get(&self, name: String) -> Result<Vec<u8>, StatusCode> {
+        self.data
+            .lock()
+            .await
+            .get(&name)
+            .cloned()
+            .ok_or(StatusCode::NOT_FOUND)
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Command::parse();
 
-    // In your main function
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let database = Database::new();
 
-    // build our application with a single route
     let app = Router::new()
-        .route("/video/stutter.mp4", get(file_stream))
-        .route("/", get(video_html))
-        .layer(cors);
+        .route("/", get(frontend))
+        .route("/video", get(file_stream))
+        .route("/upload", post(upload))
+        .layer(DefaultBodyLimit::max(4096))
+        .with_state(database);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
 
     println!("listening on port: {:?}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
-
-    println!();
 }
