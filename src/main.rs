@@ -1,6 +1,7 @@
 use std::io::Cursor;
 use std::{collections::HashMap, sync::Arc};
 
+use axum::extract::Path;
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Multipart, State},
@@ -21,7 +22,10 @@ struct Command {
     video_path: Option<String>,
 }
 
-async fn file_stream(State(state): State<Database>, name: String) -> Result<Response, StatusCode> {
+async fn file_stream(
+    State(state): State<Database>,
+    Path(name): Path<String>,
+) -> Result<Response, StatusCode> {
     let file = state.get(name).await?;
 
     // Create the basic file stream
@@ -162,9 +166,9 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(frontend))
-        .route("/video", get(file_stream))
+        .route("/video/:name", get(file_stream))
         .route("/upload", post(upload))
-        .layer(DefaultBodyLimit::max(4096))
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 100))
         .with_state(database);
 
     let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
